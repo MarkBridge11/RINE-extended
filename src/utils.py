@@ -342,7 +342,7 @@ def get_our_trained_model(ncls, device):
         device=device,
     )
     setting = "ldm" if ncls == "ldm" else f"{ncls}class"
-    ckpt_path = f"ckpt/model_{setting}_trainable.pth"
+    ckpt_path = f"/content/RINE-extended/ckpt/model_{setting}_trainable.pth"
     state_dict = torch.load(ckpt_path, map_location=device)
     for name in state_dict:
         exec(
