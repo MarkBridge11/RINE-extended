@@ -98,11 +98,6 @@ class Model(nn.Module):
     def forward(self, x):
         with torch.no_grad():
             self.clip.encode_image(x)
-
-            for h in self.hooks[:1]:  # just check first block
-                print("Hook output:", h.output.shape)      # should be [B, seq_len, D]
-                print("CLS slice:", h.output[:, 0, :].shape)  # [B, D]
-            
             g = torch.stack([h.output for h in self.hooks], dim=2)[0, :, :, :] # 0 means the current image being processed, : all the tokens, : all the hooks, : for each feature_dim of the embedding
         g = self.proj1(g.float())
 
