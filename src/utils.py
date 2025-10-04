@@ -558,7 +558,7 @@ def train_multiclass(model_setting,device,epochs_reduce_lr,workers=12,epochs=1):
 
 def get_model(device,ckpt_path,nproj=4,proj_dim=1024):
     model = Model(
-        backbone=("ViT-L/14", 1024),
+        backbone=("ViT-L/14", proj_dim),
         nproj=nproj,
         proj_dim=proj_dim,
         device=device,
