@@ -22,6 +22,12 @@ from src.data import TrainingDataset, TrainingDatasetLDM, EvaluationDataset
 from src.models import Model
 from src.ablations import ModelAblations
 
+from src.data_multiclass import CustomDataset, HuggingFaceDataset #added
+from sklearn.preprocessing import label_binarize #added
+from sklearn.metrics import classification_report #added
+from datasets import load_dataset, load_from_disk #added
+import torchvision.transforms.functional as TF # added
+
 
 def get_transforms():
     transforms_train = transforms.Compose(
@@ -173,7 +179,7 @@ def train_one_experiment(
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=experiment["lr"])
-    bce = nn.BCEWithLogitsLoss(reduction="sum")
+    bce = nn.BCEWithLogitsLoss(reduction="sum") 
     if without is None or without != "contrastive":
         supcon = SupConLoss()
 
@@ -342,7 +348,7 @@ def get_our_trained_model(ncls, device):
         device=device,
     )
     setting = "ldm" if ncls == "ldm" else f"{ncls}class"
-    ckpt_path = f"/content/RINE-extended/ckpt/model_{setting}_trainable.pth"
+    ckpt_path = f"/content/RINE/ckpt/model_{setting}_trainable.pth"
     state_dict = torch.load(ckpt_path, map_location=device)
     for name in state_dict:
         exec(
@@ -350,6 +356,221 @@ def get_our_trained_model(ncls, device):
         )
     return model
 
+######################## MULTICLASS METHODS
+def get_transforms_multiclass():
+    transforms_train = transforms.Compose(
+        [
+            #transforms.Lambda(lambda img: data_augment(img)),
+            #transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.48145466, 0.4578275, 0.40821073),
+                std=(0.26862954, 0.26130258, 0.27577711),
+            ),
+        ]
+    )
+    transforms_train_mask = transforms.Compose(
+        [
+            #transforms.Lambda(lambda img: data_augment(img)),
+            #transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+        ]
+    )
+    transforms_test = transforms.Compose(
+        [
+            #transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.48145466, 0.4578275, 0.40821073),
+                std=(0.26862954, 0.26130258, 0.27577711),
+            ),
+        ]
+    )
+
+
+    return transforms_train,transforms_test,transforms_train_mask
+
+
+def train_multiclass(model_setting,device,epochs_reduce_lr,workers=12,epochs=1): # CUSTOM TRAINING
+    seed_everything(0)
+
+    dataset = load_from_disk("/home/mbrigo/SID_Set_local")
+
+    train_hf = dataset["train"]
+    validation_hf = dataset["validation"]
+
+    transforms_train, _, transforms_test = get_transforms_multiclass()
+
+    training_dataset = HuggingFaceDataset(train_hf,transforms=transforms_train) # I could face problems of images not being tensors, so a transform could be needed
+    validation_dataset = HuggingFaceDataset(validation_hf,transforms=transforms_train)
+    testing_dataset = CustomDataset(split="test",transforms=transforms_test)
+
+    train = DataLoader(training_dataset, batch_size=32, 
+                       shuffle=True, num_workers=workers, 
+                       pin_memory=True, drop_last=False)
+    val = DataLoader(validation_dataset, batch_size=32, 
+                     shuffle=False, num_workers=workers, 
+                     pin_memory=True, drop_last = False)
+    test = DataLoader(testing_dataset, batch_size=32, 
+                      shuffle=False, num_workers=workers, 
+                      pin_memory=True, drop_last = False)
+
+    model = Model(backbone=("ViT-L/14", 1024),
+                  nproj=model_setting["nproj"],
+                  proj_dim=model_setting["proj_dim"],
+                  device=device)
+    model.to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(),lr=model_setting["lr"])
+    cce = nn.CrossEntropyLoss(reduction="sum") #sum, mean or none?
+    supcon = SupConLoss()
+
+    print(json.dumps(model_setting,indent=2))
+    results = {"val_loss": [], "val_acc": [], "test": {}}
+    rlr = 0 # reduce learning rate
+    training_time = 0
+    # TRAINING LOOP
+    for epoch in range(epochs):
+        training_epoch_start = time.time()
+        
+        if epoch + 1 in epochs_reduce_lr:
+            rlr += 1
+            optimizer.param_groups[0]["lr"] = model_setting["lr"] / 10**rlr
+
+        model.train()
+        # inner training loop that takes images from dataloader
+        for i,data in enumerate(train):
+            images, labels, _ = data
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            optimizer.zero_grad()
+            loss_cls = cce(outputs[0], labels)
+
+            # supervised contrastive loss
+            loss_supcon = model_setting["factor"] * supcon( # factor is the weight for the supervised contrastive loss
+                F.normalize(outputs[1]).unsqueeze(1), labels
+            )
+            
+            # total loss
+            loss_ = loss_cls + loss_supcon
+            
+            loss_.backward()
+            optimizer.step()
+            
+            print(
+                f"\r[Epoch {epoch + 1:02d}/{epochs:02d} | Batch {i + 1:04d}/{len(train):04d} | Time {training_time + time.time() - training_epoch_start:1.1f}s] loss: {loss_.item():1.4f}",
+                end="",
+            )
+
+        training_time += time.time() - training_epoch_start
+
+        #Validation
+        model.eval()
+        y_true = []
+        y_score = []
+        val_loss = 0
+        with torch.no_grad():
+            #Validation loop that takes images from val dataloader
+            print(f"Validation for epoch: {epoch}")
+            for data in val:
+                images, labels, _ = data
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss_cls = cce(outputs[0],labels)
+                loss_supcon = model_setting["factor"]*supcon(
+                    F.normalize(outputs[1]).unsqueeze(1),labels
+                )
+                loss_ = loss_cls + loss_supcon
+                val_loss += loss_.item()
+                y_true.extend(labels.cpu().numpy().tolist())
+                y_score.extend(outputs[0].argmax(dim=1).cpu().numpy().tolist()) #change to softmax since we have multiclass training
+        """
+        Here we are not using softmax because nn.CrossEntropyLoss expects raw logits (not probabilities). 
+        Internally, it applies log_softmax before computing the loss, so you don’t add softmax yourself.
+        If you need class probabilities (for ROC curves, calibration, uncertainty, etc.), then you’d explicitly do:
+            probs = torch.softmax(outputs[0], dim=1)
+        But for training (loss) and accuracy (argmax), the logits are all you need.
+        """
+
+        val_acc = accuracy_score(np.array(y_true), np.array(y_score))
+        target_names = ['real','fake','tampered']
+        print(classification_report(np.array(y_true),np.array(y_score),labels=[0,1,2],target_names=target_names))
+        results["val_loss"].append(val_loss / len(val))
+        results["val_acc"].append(val_acc)
+        print(f", val_loss: {val_loss / len(val):1.4f}, val_acc: {val_acc:1.4f}")
+
+        # Testing, here done after the final epoch 
+        if epoch + 1 == epochs:
+            print("SIDA testing set: ACC/AP")
+            test_acc = 0
+            test_ap = 0
+            model.eval()
+            y_true = []
+            y_score = []
+            y_probs = []  # <-- collect probabilities here
+            with torch.no_grad():
+                print(f"Testing with SIDA test:")
+                for data in test:
+                    images, labels, _ = data
+                    images, labels = images.to(device), labels.to(device)
+                    outputs = model(images)
+
+                    # true labels
+                    y_true.extend(labels.cpu().numpy().tolist())
+
+                    # hard predictions (for accuracy/classification_report)
+                    y_score.extend(outputs[0].argmax(dim=1).cpu().numpy().tolist())
+
+                    # softmax probabilities (for AP)
+                    batch_probs = torch.softmax(outputs[0], dim=1).cpu().numpy()
+                    y_probs.extend(batch_probs)
+
+            # Convert to numpy
+            y_true = np.array(y_true)
+            y_score = np.array(y_score)
+            y_probs = np.array(y_probs)
+
+            # Accuracy
+            test_acc = accuracy_score(y_true, y_score)
+            print(classification_report(y_true, y_score, labels=[0,1,2], target_names=target_names))
+
+            # Average Precision (macro)
+            y_true_onehot = label_binarize(y_true, classes=[0,1,2])
+            test_ap = average_precision_score(y_true_onehot, y_probs, average="macro")
+
+            results["test"]["SIDA"] = {
+                "acc": test_acc,
+                "ap": test_ap
+            }
+
+            print(f"SIDA test set: {100*test_acc:1.1f}/{100*test_ap:1.1f}")
+
+            ckpt_name = f"/home/mbrigo/RINE/ckpt/RINE_multiclass_SIDA_dataset_{epoch}_of_{epochs}_{model_setting['nproj']}_{model_setting['proj_dim']}_{model_setting['factor']}.pth"
+            torch.save(
+                {
+                    k:model.state_dict()[k]
+                    for k in model.state_dict() # save everything that is not CLIP
+                    if "clip" not in k
+                },
+                ckpt_name
+            )
+
+
+def get_model(device,ckpt_path,nproj=4,proj_dim=1024):
+    model = Model(
+        backbone=("ViT-L/14", 1024),
+        nproj=nproj,
+        proj_dim=proj_dim,
+        device=device,
+    )
+    state_dict = torch.load(ckpt_path, map_location=device)
+    for name in state_dict:
+        exec(
+            f'model.{name.replace(".", "[", 1).replace(".", "].", 1)} = torch.nn.Parameter(state_dict["{name}"])'
+        )
+    return model
+
+##################################################################################
 
 def get_generators(data="progan"):
     if data == "progan":
@@ -375,6 +596,7 @@ def get_generators(data="progan"):
             "diffusion_datasets/glide_50_27",
             "diffusion_datasets/glide_100_10",
             "diffusion_datasets/dalle",
+            "chameleon",
         ]
     elif data == "synthbuster":
         return [
@@ -388,7 +610,7 @@ def get_generators(data="progan"):
             "firefly",
             "midjourney-v5",
         ]
-    
+
 
 # this function guarantees reproductivity
 # other packages also support seed options, you can add to this function
@@ -441,7 +663,7 @@ def evaluation(model, test, device, training="progan", ours=False, filename=None
             "acc": test_acc,
             "ap": test_ap,
         }
-        print(f"{g}: {100 * test_acc:1.1f} / {100 * test_ap:1.1f}")
+        print(f"{g}: Test accuracy (0.5): {100 * test_acc:1.1f} / Test mAP: {100 * test_ap:1.1f}")
     print(
         f"Mean: {100 * sum(accs) / len(accs):1.1f} / {100 * sum(aps) / len(aps):1.1f}"
     )
@@ -453,14 +675,15 @@ def evaluation(model, test, device, training="progan", ours=False, filename=None
 def data_augment(img):
     img = np.array(img)
 
-    if random.random() < 0.5:
-        sig = sample_continuous([0.0, 3.0])
-        gaussian_blur(img, sig)
+    if img.ndim == 3 and img.shape[2] == 3:
+        if random.random() < 0.5:
+            sig = sample_continuous([0.0, 3.0])
+            gaussian_blur(img, sig)
 
-    if random.random() < 0.5:
-        method = sample_discrete(["cv2", "pil"])
-        qual = sample_discrete([30, 100])
-        img = jpeg_from_key(img, qual, method)
+        if random.random() < 0.5:
+            method = sample_discrete(["cv2", "pil"])
+            qual = sample_discrete([30, 100])
+            img = jpeg_from_key(img, qual, method)
 
     return Image.fromarray(img)
 
